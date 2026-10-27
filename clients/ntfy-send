@@ -1,0 +1,64 @@
+#!/bin/sh
+# ntfy-send - POSIX sh, works on Linux and OPNsense/FreeBSD (needs curl).
+# Publishes via the router failover proxy. If even that fails (router or both servers down),
+# the message is spooled and re-sent by `ntfy-send -f` (run it from cron every minute).
+#
+#   ntfy-send [-t title] [-p priority] [-g tags] [-c click-url] [-m] <topic> <message|->
+#   ntfy-send -f            # flush the spool
+#     -m  markdown;  message "-" reads stdin
+#
+# Config: env file at /etc/ntfy-send.conf (or $NTFY_SEND_CONF):
+#   NTFY_URL=http://192.168.1.1:8080
+#   NTFY_TOKEN=tk_...
+#   NTFY_SPOOL=/var/spool/ntfy-send      # optional
+set -u
+CONF=${NTFY_SEND_CONF:-/etc/ntfy-send.conf}
+[ -r "$CONF" ] && . "$CONF"
+: "${NTFY_URL:?NTFY_URL not set (see $CONF)}" "${NTFY_TOKEN:?NTFY_TOKEN not set}"
+SPOOL=${NTFY_SPOOL:-/var/spool/ntfy-send}
+
+title= prio= tags= click= md= flush=
+while getopts t:p:g:c:mf o; do
+  case $o in
+    t) title=$OPTARG ;; p) prio=$OPTARG ;; g) tags=$OPTARG ;; c) click=$OPTARG ;; m) md=yes ;; f) flush=yes ;;
+    *) echo "usage: $0 [-t title] [-p prio] [-g tags] [-c url] [-m] topic message | $0 -f" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+send() { # uses $topic $msg $title $prio $tags $click $md
+  set -- -fsS --connect-timeout 3 -m 10 -o /dev/null -H "Authorization: Bearer $NTFY_TOKEN" --data-binary "$msg"
+  [ -n "$title" ] && set -- "$@" -H "Title: $title"
+  [ -n "$prio" ]  && set -- "$@" -H "Priority: $prio"
+  [ -n "$tags" ]  && set -- "$@" -H "Tags: $tags"
+  [ -n "$click" ] && set -- "$@" -H "Click: $click"
+  [ -n "$md" ]    && set -- "$@" -H "Markdown: yes"
+  curl "$@" "${NTFY_URL%/}/$topic"
+}
+
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+spool() {
+  mkdir -p "$SPOOL" && chmod 700 "$SPOOL" || return 1
+  f="$SPOOL/$(date +%s).$$"
+  { echo "topic=$(q "$topic")"; echo "msg=$(q "$msg")"; echo "title=$(q "${title:-$topic}")"
+    echo "prio=$(q "$prio")"; echo "tags=$(q "$tags")"; echo "click=$(q "$click")"; echo "md=$(q "$md")"
+    echo "at=$(q "$(date +%H:%M)")"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+if [ -n "$flush" ]; then
+  [ -d "$SPOOL" ] || exit 0
+  for f in $(ls "$SPOOL" 2>/dev/null | grep -v '\.tmp$' | sort -n); do
+    . "$SPOOL/$f"
+    title="[delayed $at] $title"
+    send 2>/dev/null && rm -f "$SPOOL/$f" || exit 1   # keep order: stop at first failure
+  done
+  exit 0
+fi
+
+topic=${1:?topic required}; msg=${2:?message required (or - for stdin)}
+[ "$msg" = "-" ] && msg=$(cat)
+
+send && exit 0
+spool && logger -t ntfy-send "spooled [$topic] ${title:+$title: }$msg" 2>/dev/null
+exit 1

@@ -1,0 +1,11 @@
+# Optional: run the failover proxy on a Linux box instead of OPNsense.
+# On OPNsense use the HAProxy plugin with the settings from config.env (see README).
+services:
+  haproxy:
+    image: haproxy:2.8-alpine
+    restart: unless-stopped
+    env_file: [config.env]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro

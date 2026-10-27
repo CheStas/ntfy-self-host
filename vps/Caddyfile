@@ -1,0 +1,3 @@
+{$NTFY_BASE_URL} {
+	reverse_proxy ntfy:80
+}
