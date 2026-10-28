@@ -17,8 +17,8 @@ services:
       retries: 3
 
   backfill:
-    image: python:3.13-alpine
-    command: python -u /app/backfill.py
+    image: node:24.22.1-alpine
+    command: node /app/backfill.mjs
     restart: unless-stopped
     env_file: [config.env, secrets.env]
     volumes:

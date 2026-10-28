@@ -14,26 +14,42 @@ cd "$(dirname "$0")"
 
 USER_NAME=${NTFY_USER:-stas}
 CLIENTS=${CLIENTS:-homeassistant,opnsense,servers}
-NTFY_IMAGE=${NTFY_IMAGE:-binwiederhier/ntfy:v2.14.0}
+# Fully qualified: podman refuses short names when it can't prompt.
+NTFY_IMAGE=${NTFY_IMAGE:-docker.io/binwiederhier/ntfy:v2.14.0}
+
+die() { echo "init.sh: $*" >&2; exit 1; }
 
 for f in vps/secrets.env home/secrets.env clients.env; do
   [ -e "$f" ] && { echo "$f already exists - remove it to regenerate" >&2; exit 1; }
 done
 
-if [ -z "${NTFY_PASSWORD:-}" ]; then
-  printf 'Password for %s (phone/web login): ' "$USER_NAME"; stty -echo; read -r NTFY_PASSWORD; stty echo; echo
+# Hashing needs the ntfy binary: NTFY_BIN if set, else the image via docker or podman.
+if [ -n "${NTFY_BIN:-}" ]; then
+  NTFY="$NTFY_BIN"
+else
+  RT=$(command -v docker || command -v podman) || die "need docker or podman (or set NTFY_BIN=/path/to/ntfy)"
+  "$RT" image inspect "$NTFY_IMAGE" >/dev/null 2>&1 || "$RT" pull "$NTFY_IMAGE" || die "cannot pull $NTFY_IMAGE"
+  NTFY="$RT run --rm -i $NTFY_IMAGE"
 fi
 
-rand() { LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c "$1"; }
+if [ -z "${NTFY_PASSWORD:-}" ]; then
+  [ -t 0 ] || die "stdin is not a terminal; set NTFY_PASSWORD"
+  trap 'stty echo' EXIT INT TERM
+  printf 'Password for %s (phone/web login): ' "$USER_NAME"; stty -echo; read -r NTFY_PASSWORD; stty echo; echo
+fi
+[ -n "$NTFY_PASSWORD" ] || die "empty password"
+
+rand() { LC_ALL=C tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c "$1"; }
 token() { echo "tk_$(rand 29)"; }
 hash() {
-  if [ -n "${NTFY_BIN:-}" ]; then printf '%s\n%s\n' "$1" "$1" | "$NTFY_BIN" user hash 2>/dev/null
-  else printf '%s\n%s\n' "$1" "$1" | docker run --rm -i "$NTFY_IMAGE" user hash 2>/dev/null
-  fi | grep -o '\$2[aby]\$.*'
+  h=$(printf '%s\n%s\n' "$1" "$1" | $NTFY user hash 2>&1) || die "ntfy user hash failed: $h"
+  printf '%s\n' "$h" | grep -o '\$2[aby]\$[^[:space:]]*' || die "unexpected ntfy user hash output: $h"
 }
+echo "Hashing passwords..."
 
 # Service accounts get random passwords; they only ever use tokens.
-USERS="'$USER_NAME:$(hash "$NTFY_PASSWORD"):admin,publisher:$(hash "$(rand 32)"):user,backfill:$(hash "$(rand 32)"):user"
+H_ADMIN=$(hash "$NTFY_PASSWORD"); H_PUB=$(hash "$(rand 32)"); H_BF=$(hash "$(rand 32)")
+USERS="'$USER_NAME:$H_ADMIN:admin,publisher:$H_PUB:user,backfill:$H_BF:user"
 
 PUB_TOKENS=""; CLIENT_LINES=""
 for c in $(echo "$CLIENTS" | tr ',' ' '); do

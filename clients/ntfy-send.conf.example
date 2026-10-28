@@ -3,5 +3,3 @@
 NTFY_URL=http://192.168.1.1:8080
 # This machine's publisher token from clients.env.
 NTFY_TOKEN=tk_...
-# Where undeliverable messages wait for `ntfy-send -f`.
-NTFY_SPOOL=/var/spool/ntfy-send

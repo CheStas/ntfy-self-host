@@ -15,7 +15,7 @@ services:
       retries: 3
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.10.2-alpine
     restart: unless-stopped
     env_file: [config.env]
     ports:

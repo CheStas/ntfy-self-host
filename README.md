@@ -18,8 +18,8 @@ it adds no new failure mode.
 | Home server down | Nothing changes. |
 | Link / VPS down, you're home | Router health check marks the VPS down (~5–10 s), sends to the home server; phone gets it on Wi-Fi. Backfill posts "VPS unreachable" on `relay`. When the link returns, everything is copied to the VPS as silent `[delayed HH:MM]` messages, plus a "reachable again" notice. |
 | Link down, you're away | Delivered late via backfill; nothing lost. |
-| Router down, or both servers down | `ntfy-send` spools to disk and re-sends from cron. HA/OPNsense native notifications are lost. |
-| First seconds of an outage | Requests sent before the health check notices fail. `ntfy-send` spools them; HA logs an error. |
+| First seconds of an outage | The first request to the dead VPS fails to connect (≤3 s), HAProxy marks it down and retries that same request on the home server. Nothing lost. |
+| Router down, or both servers down | Messages are lost (senders get an error). The router being down means the link is down anyway; both servers down at once is rare enough to accept. |
 
 ## Configuration layout
 
@@ -29,7 +29,7 @@ Everything is set through env files; the compose files and `haproxy.cfg` contain
 vps/     config.env  (commit)   secrets.env (generated, gitignored)   docker-compose.yml  Caddyfile
 home/    config.env  (commit)   secrets.env (generated, gitignored)   docker-compose.yml  backfill/
 router/  config.env  (commit)   haproxy.cfg                           docker-compose.yml (Linux alternative)
-clients/ ntfy-send   ntfy-send.conf.example
+clients/ ntfy-send   ntfy-send.conf.example   (optional curl wrapper)
 init.sh  → writes vps/secrets.env, home/secrets.env, clients.env
 ```
 
@@ -60,8 +60,11 @@ The values are the ones in `router/config.env`; `router/haproxy.cfg` is the equi
   - `home`: address/port from `NTFY_HOME_ADDR`, mode **backup**, no SSL.
 - **Health Monitor**: type HTTP, method GET, path `/v1/health`, HTTP host `NTFY_VPS_HOST`,
   interval `CHECK_INTERVAL`.
+  In the `vps` server's advanced/pass-through options add `observe layer4 error-limit 1 on-error mark-down`
+  (fast failover: the first failed connection marks the VPS down).
 - **Backend Pool**: mode HTTP, servers `vps` + `home`, the health monitor above, and in the advanced
-  pass-through options: `http-request set-header Host <NTFY_VPS_HOST>` (Caddy routes by Host).
+  pass-through options: `http-request set-header Host <NTFY_VPS_HOST>` (Caddy routes by Host),
+  `option redispatch` and `retries 2` (retry a failed request on the home server).
 - **Public Service**: listen on `<LAN IP>:8080` (add each VLAN IP that has senders), type HTTP, default backend = the pool.
 - **Firewall**: allow sender networks → router TCP 8080. Optional: Unbound host override `ntfy.lan` → router IP.
 
@@ -74,14 +77,14 @@ All senders use **one URL** (`http://<router>:8080`) and their own token from `c
 - **Home Assistant** — built-in ntfy integration: URL `http://<router>:8080`, topic `homeassistant`,
   token `NTFY_TOKEN_HOMEASSISTANT`. Or a `rest_command` posting to the same URL with
   `Authorization: Bearer <token>`.
-- **Linux** — install `clients/ntfy-send` to `/usr/local/bin`, `clients/ntfy-send.conf.example` → `/etc/ntfy-send.conf` (chmod 600),
-  and a cron entry `* * * * * /usr/local/bin/ntfy-send -f` to flush the spool.
+- **Linux** — plain `curl -H "Authorization: Bearer <token>" -d "msg" http://<router>:8080/<topic>` works.
+  Or install `clients/ntfy-send` to `/usr/local/bin` and `clients/ntfy-send.conf.example` → `/etc/ntfy-send.conf` (chmod 600):
   ```sh
   ntfy-send -t "Backup failed" -p high -g warning servers "restic exit 1"
   journalctl -u foo -n 20 | ntfy-send -t "foo crashed" servers -
   ```
 - **OPNsense** — same script (POSIX sh) with `NTFY_URL=http://127.0.0.1:8080`, called from Monit
-  (*Execute* action) or cron; add the flush via System → Settings → Cron.
+  (*Execute* action) or cron.
 
 ## Phone
 
@@ -100,6 +103,7 @@ the later VPS copy is silent (`BACKFILL_PRIORITY=2`). Android: enable *instant d
 - **Attachments** uploaded during an outage stay on the home server; attachment URLs are backfilled.
 - **LAN leg is plain HTTP** (tokens in clear on your LAN). Add a TLS frontend on HAProxy if that matters.
 - **Versions**: image tags are pinned in the compose files; change them there.
+- **Backfill** is a single dependency-free Node file (`home/backfill/backfill.mjs`). `TZ` takes normal names (`Europe/Berlin`).
 
-Tested with ntfy v2.14.0 + HAProxy 2.8: normal path, VPS outage → home → backfill (twice),
-150-message bursts both ways, router down → spool → flush.
+Tested with ntfy v2.14.0 + HAProxy 2.8 + Node 24: normal path, VPS outage → immediate failover of the
+in-flight request → home → backfill (repeated outages).
