@@ -2,7 +2,7 @@
 # On OPNsense use the HAProxy plugin with the settings from config.env (see README).
 services:
   haproxy:
-    image: haproxy:2.8-alpine
+    image: docker.io/haproxy:2.8-alpine
     restart: unless-stopped
     env_file: [config.env]
     ports:
