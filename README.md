@@ -29,7 +29,7 @@ Everything is set through env files; the compose files and `haproxy.cfg` contain
 vps/     config.env  (commit)   secrets.env (generated, gitignored)   docker-compose.yml  Caddyfile
 home/    config.env  (commit)   secrets.env (generated, gitignored)   docker-compose.yml  backfill/
 router/  config.env  (commit)   haproxy.cfg                           docker-compose.yml (Linux alternative)
-clients/ ntfy-send   ntfy-send.conf.example   (optional curl wrapper)
+clients/ ntfy-send   ntfy-send.conf.example   (optional curl wrapper)   monit-ntfy[-urgent] (OPNsense Monit hooks)
 init.sh  → writes vps/secrets.env, home/secrets.env, clients.env
 ```
 
@@ -83,8 +83,144 @@ All senders use **one URL** (`http://<router>:8080`) and their own token from `c
   ntfy-send -t "Backup failed" -p high -g warning servers "restic exit 1"
   journalctl -u foo -n 20 | ntfy-send -t "foo crashed" servers -
   ```
-- **OPNsense** — same script (POSIX sh) with `NTFY_URL=http://127.0.0.1:8080`, called from Monit
-  (*Execute* action) or cron.
+- **OPNsense** — same script (POSIX sh), triggered by Monit. See the next section.
+
+## OPNsense: Monit → ntfy
+
+OPNsense's Monit can only *mail* alerts or *execute* a program. We use **Execute** with
+`clients/monit-ntfy`, a tiny wrapper that turns Monit's `MONIT_SERVICE` / `MONIT_EVENT` /
+`MONIT_DESCRIPTION` variables into an `ntfy-send` call.
+
+Why not put an `ntfy-send …` command straight into Monit's *Path* field? Monit runs that field
+**without a shell**: no quoting (a title with spaces gets split), no pipes, no `$MONIT_*` expansion,
+and its `PATH` doesn't include `/usr/local/bin`, so `curl` isn't found. The wrapper takes care of that.
+
+### 1. Install the scripts (one-time, over SSH)
+
+The OPNsense web UI has no way to upload files or edit arbitrary files, so this step is CLI only.
+Enable SSH under **System → Settings → Administration → Secure Shell** (enable, allow root login or
+use an admin user with sudo; you can turn it off again afterwards). From this repo:
+
+```sh
+FW=root@192.168.1.1
+scp clients/ntfy-send clients/monit-ntfy clients/monit-ntfy-urgent $FW:/usr/local/bin/
+ssh $FW 'cd /usr/local/bin && chmod 755 ntfy-send monit-ntfy monit-ntfy-urgent'
+# config: router LAN IP + the opnsense token from clients.env
+ssh $FW 'umask 077; cat > /etc/ntfy-send.conf' <<EOF
+NTFY_URL=http://192.168.1.1:8080
+NTFY_TOKEN=$(sed -n 's/^NTFY_TOKEN_OPNSENSE=//p' clients.env)
+EOF
+```
+
+`NTFY_URL` is the router's own LAN IP, because that's where HAProxy listens (`127.0.0.1` only works if
+you add `127.0.0.1:8080` to the Public Service listen addresses). `curl` is part of the base install.
+
+These files survive reboots and firmware updates, but they are **not** in the `config.xml` backup —
+after a reinstall/restore, run the commands above again.
+
+### 2. Configure Monit (web UI)
+
+**Services → Monit → Settings**
+
+- **General Settings**: *Enable Monit* on. *Polling Interval* (default 120 s) is how often tests run —
+  and so the worst-case delay before a notification; lower it (e.g. 30 s) for quicker gateway alerts.
+  Mail server settings aren't needed.
+
+- **Service Tests Settings**: add tests whose **Action = Execute** and **Path = `/usr/local/bin/monit-ntfy`**.
+  The defaults (`CPUUsage`, `SpaceUsage`, …) use action *Alert* (mail), so create ntfy copies:
+
+  | Name | Condition | Action | Path |
+  |---|---|---|---|
+  | `ntfy_cpu` | `cpu usage is greater than 90% for 5 cycles` | Execute | `/usr/local/bin/monit-ntfy` |
+  | `ntfy_mem` | `memory usage is greater than 85% for 3 cycles` | Execute | `/usr/local/bin/monit-ntfy` |
+  | `ntfy_load` | `loadavg (5min) is greater than 4` | Execute | `/usr/local/bin/monit-ntfy` |
+  | `ntfy_space` | `space usage is greater than 80%` | Execute | `/usr/local/bin/monit-ntfy` |
+  | `ntfy_status` | `status != 0` | Execute | `/usr/local/bin/monit-ntfy` |
+  | `ntfy_changed` | `changed status` | Execute | `/usr/local/bin/monit-ntfy-urgent` |
+
+  The *Path* field accepts no spaces, so it can't take arguments. `monit-ntfy` sends to topic `opnsense`
+  with priority `high`; `monit-ntfy-urgent` is the same with priority `urgent`. For another topic or
+  priority, copy `monit-ntfy-urgent` and change the `exec` line.
+  `for N cycles` means "only if it stays true for N polls" — use it to avoid noise from short spikes.
+  If your version asks for a test *Type*, pick the one matching the condition (or *Custom*).
+
+- **Service Settings**: attach the tests to services (edit a service → *Tests*):
+
+  | Service (shipped by default) | Type | Watches | Tests |
+  |---|---|---|---|
+  | `$HOST` | System | the firewall itself | `ntfy_cpu`, `ntfy_mem`, `ntfy_load` |
+  | `RootFs` | Filesystem, path `/` | disk full | `ntfy_space` |
+  | `gateway_alert` | Custom (runs OPNsense's `gateway_alert.php`) | WAN gateway down / packet loss, down **and** recovered | `ntfy_changed` |
+  | `carp_status_change` | Custom (only with CARP) | CARP failover | `ntfy_status` |
+
+  Your own checks work the same way: any script that exits non-zero on a problem → service type
+  *Custom*, its path, test `ntfy_status`.
+
+  The default services may be disabled — enable the ones you use, and remove their mail-only tests if
+  you don't use mail. Then **Apply**.
+
+  `gateway_alert` fires when **any** monitored gateway is down or over its loss/delay limits — also a
+  single WAN in a gateway group (gateways with *Disable Gateway Monitoring* are skipped). With one WAN
+  of several down, the message still goes out via the VPS; only when all WANs are down does it go to
+  the **home** server (phone on Wi-Fi), to be backfilled to the VPS later.
+
+#### Recovered notifications
+
+Monit runs the action once, when a test **starts** failing; the OPNsense UI doesn't expose Monit's
+`else if succeeded` branch. Two ways to still get "recovered" messages:
+
+- **`changed status` (recommended, used above)** — one test that fires whenever the script's exit
+  code changes, i.e. on down *and* on recovery. Nothing is sent when Monit starts (the first run only
+  sets the baseline). Both messages have the same title; the body shows the transition,
+  e.g. `status changed (1 -> 0)`, plus the script's output on the way down.
+- **A second, opposite test** — keep `ntfy_status` (`status != 0`) on the service and add
+  `ntfy_ok` (`status = 0`, Execute) next to it. `status = 0` "fails" exactly when the check recovers.
+  Drawbacks: it also fires after every Monit start (Apply, reboot) while all is fine, the service
+  shows as failed in **Services → Monit → Status**, and Monit calls the event "Status failed", so point
+  it at its own script with a fixed title, e.g. `/usr/local/bin/monit-ntfy-ok`:
+  ```sh
+  #!/bin/sh
+  PATH=/usr/local/bin:/bin:/usr/bin; export PATH
+  exec ntfy-send -t "${MONIT_SERVICE:-monit}: recovered" -p low -g white_check_mark opnsense \
+    "${MONIT_DESCRIPTION:-recovered}"
+  ```
+
+Things to know:
+
+- Monit executes the action **once per state change** (when the test starts failing), not every cycle.
+  With `changed status`, a second WAN going down while the first is still down changes the output but
+  not necessarily the exit code, so it may not send a second message.
+- `MONIT_DESCRIPTION` contains Monit's text, and for Custom (program) services also the script's output,
+  e.g. `status failed (1) -- WAN_DHCP: down`.
+- If sending fails (router proxy down…), `ntfy-send` logs `ntfy-send failed [...]` to syslog.
+
+### 3. Test it
+
+1. **Script works** (SSH on the firewall):
+   ```sh
+   ntfy-send -t "test" opnsense "hello from opnsense"; echo "exit $?"   # expect exit 0 + phone notification
+   ```
+   `exit 1` + `curl: (7) Failed to connect` → wrong `NTFY_URL` / HAProxy not listening there.
+   `curl: (22) … 401/403` → wrong token.
+
+2. **Wrapper works with Monit's environment** (empty env, Monit's PATH):
+   ```sh
+   env -i PATH=/bin:/usr/bin:/sbin:/usr/sbin MONIT_SERVICE=test MONIT_EVENT="Status failed" \
+     MONIT_DESCRIPTION="manual wrapper test" /usr/local/bin/monit-ntfy; echo "exit $?"
+   ```
+
+3. **End-to-end through Monit**: in **Service Settings** add a throw-away service
+   `ntfy_selftest`, type *Custom*, path `/usr/bin/false`, test `ntfy_status`. Apply. Within one polling
+   interval you get *"ntfy_selftest: Status failed"*. Watch it in **Services → Monit → Status**, or on the
+   shell `monit status ntfy_selftest`. Delete the service afterwards.
+   (Alternative: temporarily set `ntfy_space` to `space usage is greater than 1%`.)
+
+4. **Failover path**: on the VPS `docker compose stop ntfy` (or unplug the WAN), repeat step 1. The message
+   arrives from the **home** server (**Services → HAProxy → Statistics** shows `vps` DOWN). Start the VPS
+   again → within a minute a silent `[delayed HH:MM]` copy appears on the VPS plus a "reachable again" note on `relay`.
+
+Nothing arrives? Check the Monit log (**Services → Monit → Log File**, or `System → Log Files → General`
+filtered by `monit` / `ntfy-send`), and that the test's *Action* really is *Execute* (not *Alert*).
 
 ## Phone
 

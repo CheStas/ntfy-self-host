@@ -1,0 +1,14 @@
+#!/bin/sh
+# monit-ntfy - target for a Monit "Execute" action (OPNsense: Service Tests -> Action Execute -> Path).
+# Turns the MONIT_* variables Monit sets into an ntfy message via ntfy-send.
+#
+#   monit-ntfy [topic] [priority]        defaults: opnsense high
+#
+# Why a wrapper: Monit runs the Path without a shell (no quotes, no pipes, no $VARS) and with
+# PATH=/bin:/usr/bin:/sbin:/usr/sbin, where curl (/usr/local/bin on FreeBSD) isn't found.
+PATH=/usr/local/bin:/usr/local/sbin:/bin:/usr/bin:/sbin:/usr/sbin
+export PATH
+
+exec ntfy-send -t "${MONIT_SERVICE:-monit}: ${MONIT_EVENT:-event}" -p "${2:-high}" -g warning \
+  "${1:-opnsense}" "${MONIT_DESCRIPTION:-no description}
+${MONIT_HOST:-$(hostname)} ${MONIT_DATE:-$(date)}"

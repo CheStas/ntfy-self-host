@@ -1,5 +1,6 @@
 # /etc/ntfy-send.conf  (chmod 600) - env file, shell syntax.
-# Router failover proxy; on OPNsense itself use http://127.0.0.1:8080.
+# Router failover proxy. On OPNsense itself use the same LAN IP (HAProxy listens there);
+# 127.0.0.1 only works if you added 127.0.0.1:8080 to the HAProxy listen addresses.
 NTFY_URL=http://192.168.1.1:8080
-# This machine's publisher token from clients.env.
+# This machine's publisher token from clients.env (OPNsense: NTFY_TOKEN_OPNSENSE).
 NTFY_TOKEN=tk_...

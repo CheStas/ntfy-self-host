@@ -1,0 +1,4 @@
+#!/bin/sh
+# monit-ntfy-urgent - monit-ntfy with priority "urgent". A separate file because OPNsense's
+# Monit test "Path" field accepts no spaces, so arguments can't be passed there.
+exec /usr/local/bin/monit-ntfy opnsense urgent
